@@ -4,10 +4,9 @@ Dataset loading, filtering, and sanitization routines for SWE-bench instances.
 """
 
 import re
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 import pandas as pd
 from datasets import load_dataset, Dataset
-
 
 # Regex patterns for markdown, HTML, and media sanitization
 _HTML_COMMENT_PATTERN = re.compile(r"<!--.*?-->", flags=re.DOTALL)
@@ -16,11 +15,53 @@ _RAW_HTML_IMG_PATTERN = re.compile(r"<img[^>]*>", flags=re.IGNORECASE)
 _BASE64_PATTERN = re.compile(r"data:image\/[a-zA-Z]+;base64,[A-Za-z0-9+/=]+")
 _EXCESS_WHITESPACE = re.compile(r"\n{3,}")
 
-# Pattern for identifying large traceback frame dumps in problem statements
-_TRACEBACK_PATTERN = re.compile(
-    r"(Traceback \(most recent call last\):.*?\n)(?:[ ]+File \".*?\", line \d+.*\n(?:[ ]+.*\n)?)+([a-zA-Z_][a-zA-Z0-9_]*Error:.*)",
-    flags=re.MULTILINE
-)
+
+def _compress_tracebacks(text: str) -> str:
+    """
+    Linear O(N) scan that safely truncates intermediate frames in deep stack traces
+    without triggering regular expression catastrophic backtracking.
+    """
+    if "Traceback (most recent call last):" not in text:
+        return text
+
+    lines = text.splitlines()
+    result: List[str] = []
+    i = 0
+    n = len(lines)
+
+    while i < n:
+        line = lines[i]
+        if "Traceback (most recent call last):" in line:
+            result.append(line)
+            i += 1
+            tb_frames: List[str] = []
+
+            # Gather traceback frame lines until we hit an unindented line (the error) or blank line
+            while i < n:
+                curr = lines[i]
+                if curr.strip() == "":
+                    i += 1
+                    break
+                # If unindented, it's typically the final exception statement (e.g. ValueError: ...)
+                if not curr.startswith(" ") and not curr.startswith("\t"):
+                    tb_frames.append(curr)
+                    i += 1
+                    break
+                tb_frames.append(curr)
+                i += 1
+
+            # Truncate intermediate frames if the traceback is long
+            if len(tb_frames) > 6:
+                result.extend(tb_frames[:2])
+                result.append("  [... intermediate stack frames truncated ...]")
+                result.extend(tb_frames[-2:])
+            else:
+                result.extend(tb_frames)
+        else:
+            result.append(line)
+            i += 1
+
+    return "\n".join(result)
 
 
 def clean_problem_statement(text: str) -> str:
@@ -28,7 +69,7 @@ def clean_problem_statement(text: str) -> str:
     Sanitizes raw GitHub issue descriptions:
     1. Removes HTML comments and base64 image blobs.
     2. Removes markdown and HTML image tags.
-    3. Collapses repetitive traceback frames while preserving the exception signature.
+    3. Collapses repetitive traceback frames linearly while preserving the exception signature.
     4. Normalizes extraneous whitespace.
     """
     if not isinstance(text, str):
@@ -40,8 +81,8 @@ def clean_problem_statement(text: str) -> str:
     cleaned = _MARKDOWN_IMAGE_PATTERN.sub("", cleaned)
     cleaned = _RAW_HTML_IMG_PATTERN.sub("", cleaned)
 
-    # Compress deep stack traces: preserve the header and final exception line
-    cleaned = _TRACEBACK_PATTERN.sub(r"\1  [... intermediate stack frames truncated ...]\n\2", cleaned)
+    # Compress deep stack traces safely
+    cleaned = _compress_tracebacks(cleaned)
 
     # Normalize excessive newlines
     cleaned = _EXCESS_WHITESPACE.sub("\n\n", cleaned)
@@ -51,7 +92,7 @@ def clean_problem_statement(text: str) -> str:
 def strip_test_patch_comments(patch_text: str) -> str:
     """
     Removes inline comments, comment-only lines, and docstrings from unified test patches
-    to prevent trivial semantic leakage (e.g., test function descriptions or issue references).
+    to prevent trivial semantic leakage into context configurations.
     """
     if not isinstance(patch_text, str) or not patch_text.strip():
         return ""
@@ -65,10 +106,8 @@ def strip_test_patch_comments(patch_text: str) -> str:
             cleaned_lines.append(line)
             continue
 
-        # For added lines or context lines, remove comments and docstrings
         prefix = line[0] if line.startswith(("+", "-", " ")) else " "
         content = line[1:] if line.startswith(("+", "-", " ")) else line
-
         stripped_content = content.strip()
 
         # Handle docstrings (""" or ''')
@@ -78,7 +117,6 @@ def strip_test_patch_comments(patch_text: str) -> str:
                 in_multiline_docstring = not in_multiline_docstring
                 continue
             elif stripped_content.count(quotes) >= 2:
-                # Single-line docstring: drop it
                 continue
 
         if in_multiline_docstring:
@@ -88,13 +126,11 @@ def strip_test_patch_comments(patch_text: str) -> str:
         if stripped_content.startswith("#"):
             continue
 
-        # Strip trailing inline comments (e.g., `assert val == 1  # regression test`)
+        # Strip trailing inline comments safely
         if "#" in content:
-            # Basic quote-safe split: don't strip '#' inside string literals
             parts = re.split(r"(?<!['\"])#(?!['\"])", content, maxsplit=1)
             content = parts[0].rstrip()
 
-        # Reconstruct line if non-empty or header
         if content.strip() or prefix == " ":
             cleaned_lines.append(f"{prefix}{content}")
 
@@ -104,9 +140,6 @@ def strip_test_patch_comments(patch_text: str) -> str:
 def load_swebench_dataset(split: str = "verified", cache_dir: Optional[str] = None) -> Dataset:
     """
     Loads the requested SWE-bench split from Hugging Face.
-    - 'verified': 'princeton-nlp/SWE-bench_Verified' (test split, 500 validated issues)
-    - 'lite': 'princeton-nlp/SWE-bench_Lite'
-    - 'full': 'princeton-nlp/SWE-bench'
     """
     repo_mapping = {
         "verified": ("princeton-nlp/SWE-bench_Verified", "test"),
@@ -130,7 +163,6 @@ def preprocess_swebench_dataset(
 ) -> pd.DataFrame:
     """
     Cleans, sanitizes, and filters a SWE-bench Dataset into an analysis-ready pandas DataFrame.
-    Applies the issue description cleaning and test-patch comment stripping routines.
     """
     records = []
 
@@ -141,7 +173,6 @@ def preprocess_swebench_dataset(
         clean_tests = strip_test_patch_comments(raw_test_patch)
         patch = item.get("patch", "")
 
-        # Compute token or word count for threshold filtering
         if tokenizer is not None:
             issue_len = len(tokenizer.encode(clean_issue, add_special_tokens=False))
             patch_len = len(tokenizer.encode(patch, add_special_tokens=False))
@@ -151,7 +182,7 @@ def preprocess_swebench_dataset(
             patch_len = len(patch.split())
             test_len = len(clean_tests.split())
 
-        # Filter out empty patches or overly brief issue descriptions (< min_tokens)
+        # Filter out empty patches or overly brief problem descriptions (< min_tokens)
         if not patch.strip() or issue_len < min_tokens:
             continue
 
@@ -169,6 +200,4 @@ def preprocess_swebench_dataset(
             "token_count_test": test_len,
         })
 
-    df = pd.DataFrame(records)
-    print(f"Sanitization complete: Retained {len(df)} of {len(dataset)} instances.")
-    return df
+    return pd.DataFrame(records)
