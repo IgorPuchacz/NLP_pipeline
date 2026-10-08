@@ -26,7 +26,7 @@ def compute_codebert_score(predictions: List[str], references: List[str]) -> Dic
     """
     try:
         from code_bert_score import score
-        P, R, F1 = score(predictions, references, lang="python", rescale_with_baseline=True)
+        P, R, F1, _ = score(predictions, references, lang="python", rescale_with_baseline=True)
         return {
             "codebert_precision": round(float(P.mean()), 4),
             "codebert_recall": round(float(R.mean()), 4),
